@@ -1,0 +1,20 @@
+{
+  "name": "miles-apart-booth",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A photo booth for long-distance couples.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "next": "^16.3.8",
+    "peerjs": "^1.5.5",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  },
+  "engines": {
+    "node": ">=20.9.0"
+  }
+}
