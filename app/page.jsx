@@ -11,22 +11,36 @@ const PAPER = '#FAF7F2';
 const NAVY = '#1F2A44';
 const PINK = '#F2A6B5';
 
-// PeerJS options. With nothing set, PeerJS uses its free cloud signaling
+const CONNECT_TIMEOUT_MS = 25000;
+
+// Optional TURN relay, needed when two people are on different networks that
+// block direct connections (common on mobile data). Set these at build time,
+// e.g. from a free metered.ca account:
+//   NEXT_PUBLIC_TURN_URLS=turn:global.relay.metered.ca:80,turn:global.relay.metered.ca:443,turns:global.relay.metered.ca:443?transport=tcp
+//   NEXT_PUBLIC_TURN_USERNAME=...
+//   NEXT_PUBLIC_TURN_CREDENTIAL=...
+const TURN_URLS = (process.env.NEXT_PUBLIC_TURN_URLS || '')
+  .split(',')
+  .map((u) => u.trim())
+  .filter(Boolean);
+
+// PeerJS options. With no TURN set, PeerJS uses its free cloud signaling
 // server (0.peerjs.com) and its default STUN/TURN servers.
 const PEER_OPTIONS = {
   debug: 1,
-  // For better connectivity across strict NATs / mobile networks, add your own
-  // STUN/TURN servers (e.g. a free metered.ca account). Note: setting `config`
-  // replaces PeerJS's default ICE servers, so include a STUN server too.
-  // config: {
-  //   iceServers: [
-  //     { urls: 'stun:stun.relay.metered.ca:80' },
-  //     { urls: 'turn:global.relay.metered.ca:80', username: 'YOUR_USERNAME', credential: 'YOUR_CREDENTIAL' },
-  //     { urls: 'turn:global.relay.metered.ca:80?transport=tcp', username: 'YOUR_USERNAME', credential: 'YOUR_CREDENTIAL' },
-  //     { urls: 'turn:global.relay.metered.ca:443', username: 'YOUR_USERNAME', credential: 'YOUR_CREDENTIAL' },
-  //     { urls: 'turns:global.relay.metered.ca:443?transport=tcp', username: 'YOUR_USERNAME', credential: 'YOUR_CREDENTIAL' },
-  //   ],
-  // },
+  ...(TURN_URLS.length && {
+    // Setting `config` replaces PeerJS's default ICE servers, so keep a STUN server too.
+    config: {
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        {
+          urls: TURN_URLS,
+          username: process.env.NEXT_PUBLIC_TURN_USERNAME,
+          credential: process.env.NEXT_PUBLIC_TURN_CREDENTIAL,
+        },
+      ],
+    },
+  }),
 };
 
 const ERRORS = {
@@ -59,6 +73,11 @@ const ERRORS = {
     title: 'booth is full',
     body: 'This booth already has two people in it. Only 2 people per room — start your own booth instead.',
     action: 'home',
+  },
+  connectFailed: {
+    title: 'couldn’t connect',
+    body: 'We couldn’t link up with your partner. Make sure they still have the booth open on their screen (not in the background). If it keeps happening, one of you may be on a network that blocks video calls — try switching to Wi-Fi or mobile data.',
+    action: 'reload',
   },
   network: {
     title: 'connection trouble',
@@ -186,6 +205,7 @@ export default function Booth() {
   const callRef = useRef(null);
   const connRef = useRef(null);
   const partnerIdRef = useRef(null);
+  // True once the video link (ICE) is actually up, not just negotiated.
   const connectedRef = useRef(false);
   const sessionActiveRef = useRef(false);
   const sessionIdRef = useRef(0);
@@ -336,6 +356,7 @@ export default function Booth() {
     let cancelled = false;
     let peer = null;
     let stream = null;
+    let connectTimer = null;
     const room = new URLSearchParams(window.location.search).get('room');
     setIsHost(!room);
 
@@ -344,18 +365,40 @@ export default function Booth() {
     };
 
     const claimPartner = (id) => {
+      if (partnerIdRef.current && partnerIdRef.current !== id && !connectedRef.current) {
+        // The earlier attempt never got through (e.g. they reloaded); let the new one in.
+        const old = { call: callRef.current, conn: connRef.current };
+        partnerIdRef.current = null;
+        old.call?.close();
+        old.conn?.close();
+      }
       if (!partnerIdRef.current) partnerIdRef.current = id;
       return partnerIdRef.current === id;
     };
 
+    const connectFailed = (peerId) => {
+      if (connectedRef.current || cancelled) return;
+      if (room) return fail(ERRORS.connectFailed);
+      // Host: drop the failed attempt and keep the link open for another try.
+      handlePartnerLeftRef.current(peerId);
+      setNotice('Couldn’t connect to them. Ask them to open the link again.');
+    };
+
     const attachCall = (call) => {
       callRef.current = call;
-      call.on('stream', (remote) => {
-        connectedRef.current = true;
-        setRemoteStream(remote);
-        setNotice(null);
-        setStatus('connected');
+      const pc = call.peerConnection;
+      pc?.addEventListener('iceconnectionstatechange', () => {
+        const state = pc.iceConnectionState;
+        if ((state === 'connected' || state === 'completed') && !connectedRef.current) {
+          connectedRef.current = true;
+          clearTimeout(connectTimer);
+          setNotice(null);
+          setStatus('connected');
+        } else if (state === 'failed') {
+          connectFailed(call.peer);
+        }
       });
+      call.on('stream', (remote) => setRemoteStream(remote));
       call.on('close', () => handlePartnerLeftRef.current(call.peer));
       call.on('error', (err) => console.warn('call error', err));
     };
@@ -399,6 +442,7 @@ export default function Booth() {
         if (room) {
           setStatus('connecting');
           partnerIdRef.current = room;
+          connectTimer = setTimeout(() => connectFailed(room), CONNECT_TIMEOUT_MS);
           attachCall(peer.call(room, stream));
           attachConn(peer.connect(room, { reliable: true }));
         } else {
@@ -462,6 +506,7 @@ export default function Booth() {
 
     return () => {
       cancelled = true;
+      clearTimeout(connectTimer);
       window.removeEventListener('pagehide', onPageHide);
       sessionIdRef.current += 1;
       peer?.destroy();
@@ -572,7 +617,7 @@ export default function Booth() {
         {status === 'waiting' && shareLink && (
           <>
             <p className="hint">
-              Send this link to <strong>your person</strong>. The booth opens when they join.
+              Send this link to <strong>your person</strong> and keep this page open. The booth opens when they join.
             </p>
             <div className="share">
               <input id="share-link" value={shareLink} readOnly onFocus={(e) => e.target.select()} />
